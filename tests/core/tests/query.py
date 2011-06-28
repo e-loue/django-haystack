@@ -7,16 +7,13 @@ from haystack import backends
 from haystack.backends import SQ, BaseSearchQuery
 from haystack.backends.dummy_backend import SearchBackend as DummySearchBackend
 from haystack.backends.dummy_backend import SearchQuery as DummySearchQuery
-from haystack.exceptions import HaystackError, FacetingError, NotRegistered
+from haystack.exceptions import FacetingError
 from haystack.models import SearchResult
 from haystack.query import SearchQuerySet, EmptySearchQuerySet
 from haystack.sites import SearchSite
-from core.models import MockModel, AnotherMockModel, CharPKMockModel
-from core.tests.mocks import MockSearchQuery, MockSearchBackend, CharPKMockSearchBackend, MixedMockSearchBackend, MOCK_SEARCH_RESULTS
-try:
-    set
-except NameError:
-    from sets import Set as set
+from core.models import MockModel, AnotherMockModel, CharPKMockModel, AFifthMockModel
+from core.tests.indexes import ReadQuerySetTestSearchIndex
+from core.tests.mocks import MockSearchQuery, MockSearchBackend, CharPKMockSearchBackend, MixedMockSearchBackend, MOCK_SEARCH_RESULTS, ReadQuerySetMockSearchBackend
 
 test_pickling = True
 
@@ -190,6 +187,21 @@ class BaseSearchQueryTestCase(TestCase):
         
         self.bsq.add_narrow_query('moof:baz')
         self.assertEqual(self.bsq.narrow_queries, set(['foo:bar', 'moof:baz']))
+    
+    def test_set_result_class(self):
+        # Assert that we're defaulting to ``SearchResult``.
+        self.assertTrue(issubclass(self.bsq.result_class, SearchResult))
+        
+        # Custom class.
+        class IttyBittyResult(object):
+            pass
+        
+        self.bsq.set_result_class(IttyBittyResult)
+        self.assertTrue(issubclass(self.bsq.result_class, IttyBittyResult))
+        
+        # Reset to default.
+        self.bsq.set_result_class(None)
+        self.assertTrue(issubclass(self.bsq.result_class, SearchResult))
     
     def test_run(self):
         # Stow.
@@ -458,6 +470,21 @@ class SearchQuerySetTestCase(TestCase):
         self.assert_(isinstance(sqs, SearchQuerySet))
         self.assertEqual(len(sqs.query.models), 1)
     
+    def test_result_class(self):
+        sqs = self.bsqs.all()
+        self.assertTrue(issubclass(sqs.query.result_class, SearchResult))
+        
+        # Custom class.
+        class IttyBittyResult(object):
+            pass
+        
+        sqs = self.bsqs.result_class(IttyBittyResult)
+        self.assertTrue(issubclass(sqs.query.result_class, IttyBittyResult))
+        
+        # Reset to default.
+        sqs = self.bsqs.result_class(None)
+        self.assertTrue(issubclass(sqs.query.result_class, SearchResult))
+    
     def test_boost(self):
         sqs = self.bsqs.boost('foo', 10)
         self.assert_(isinstance(sqs, SearchQuerySet))
@@ -496,6 +523,34 @@ class SearchQuerySetTestCase(TestCase):
         
         # For full tests, see the solr_backend.
     
+    def test_load_all_read_queryset(self):
+        # stow
+        old_site = haystack.site
+        test_site = SearchSite()
+        # Register a default SearchIndex first (without the SoftDeleteMangaer as the read_queryset)
+        test_site.register(AFifthMockModel)
+        haystack.site = test_site
+
+        sqs = SearchQuerySet(query=MockSearchQuery(backend=ReadQuerySetMockSearchBackend()))
+        results = sqs.load_all().all()
+        results._fill_cache(0, 2)
+        # The deleted result isn't returned
+        self.assertEqual(len([result for result in results._result_cache if result is not None]), 1)
+
+        test_site.unregister(AFifthMockModel)
+        # Register a SearchIndex with a read_queryset that returns deleted items
+        test_site.register(AFifthMockModel, ReadQuerySetTestSearchIndex)
+
+        sqs = SearchQuerySet(query=MockSearchQuery(backend=ReadQuerySetMockSearchBackend()))
+        results = sqs.load_all().all()
+        results._fill_cache(0, 2)
+        # Both the deleted and not deleted items are returned
+        self.assertEqual(len([result for result in results._result_cache if result is not None]), 2)
+
+
+        # restore
+        haystack.site = old_site
+
     def test_auto_query(self):
         sqs = self.bsqs.auto_query('test search -stuff')
         self.assert_(isinstance(sqs, SearchQuerySet))

@@ -28,9 +28,12 @@ Included with Haystack are the following field types:
 * ``CharField``
 * ``DateField``
 * ``DateTimeField``
+* ``DecimalField``
+* ``EdgeNgramField``
 * ``FloatField``
 * ``IntegerField``
 * ``MultiValueField``
+* ``NgramField``
 
 And equivalent faceted versions:
 
@@ -38,9 +41,16 @@ And equivalent faceted versions:
 * ``FacetCharField``
 * ``FacetDateField``
 * ``FacetDateTimeField``
+* ``FacetDecimalField``
 * ``FacetFloatField``
 * ``FacetIntegerField``
 * ``FacetMultiValueField``
+
+.. note::
+
+  There is no faceted variant of the n-gram fields. Because of how the engine
+  generates n-grams, faceting on these field types (``NgramField`` &
+  ``EdgeNgram``) would make very little sense.
 
 
 Usage

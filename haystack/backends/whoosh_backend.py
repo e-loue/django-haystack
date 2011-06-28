@@ -8,16 +8,11 @@ from django.core.exceptions import ImproperlyConfigured
 from django.db.models.loading import get_model
 from django.utils.datetime_safe import datetime
 from django.utils.encoding import force_unicode
-from haystack.backends import BaseSearchBackend, BaseSearchQuery, log_query
+from haystack.backends import BaseSearchBackend, BaseSearchQuery, log_query, EmptyResults
 from haystack.constants import ID, DJANGO_CT, DJANGO_ID
-from haystack.fields import DateField, DateTimeField, IntegerField, FloatField, BooleanField, MultiValueField
 from haystack.exceptions import MissingDependency, SearchBackendError
 from haystack.models import SearchResult
 from haystack.utils import get_identifier
-try:
-    set
-except NameError:
-    from sets import Set as set
 try:
     import json
 except ImportError:
@@ -25,6 +20,11 @@ except ImportError:
         import simplejson as json
     except ImportError:
         from django.utils import simplejson as json
+try:
+    from django.db.models.sql.query import get_proxied_model
+except ImportError:
+    # Likely on Django 1.0
+    get_proxied_model = None
 
 try:
     import whoosh
@@ -33,7 +33,7 @@ except ImportError:
 
 # Bubble up the correct error.
 from whoosh.analysis import StemmingAnalyzer
-from whoosh.fields import Schema, IDLIST, STORED, TEXT, KEYWORD, NUMERIC, BOOLEAN, DATETIME
+from whoosh.fields import Schema, IDLIST, STORED, TEXT, KEYWORD, NUMERIC, BOOLEAN, DATETIME, NGRAM, NGRAMWORDS
 from whoosh.fields import ID as WHOOSH_ID
 from whoosh import index
 from whoosh.qparser import QueryParser
@@ -43,8 +43,8 @@ from whoosh.spelling import SpellChecker
 from whoosh.writing import AsyncWriter
 
 # Handle minimum requirement.
-if not hasattr(whoosh, '__version__') or whoosh.__version__ < (1, 1, 1):
-    raise MissingDependency("The 'whoosh' backend requires version 1.1.1 or greater.")
+if not hasattr(whoosh, '__version__') or whoosh.__version__ < (1, 8, 4):
+    raise MissingDependency("The 'whoosh' backend requires version 1.8.4 or greater.")
 
 
 DATETIME_REGEX = re.compile('^(?P<year>\d{4})-(?P<month>\d{2})-(?P<day>\d{2})T(?P<hour>\d{2}):(?P<minute>\d{2}):(?P<second>\d{2})(\.\d{3,6}Z?)?$')
@@ -132,19 +132,24 @@ class SearchBackend(BaseSearchBackend):
         for field_name, field_class in fields.items():
             if field_class.is_multivalued:
                 if field_class.indexed is False:
-                    schema_fields[field_class.index_fieldname] = IDLIST(stored=True)
+                    schema_fields[field_class.index_fieldname] = IDLIST(stored=True, field_boost=field_class.boost)
                 else:
-                    schema_fields[field_class.index_fieldname] = KEYWORD(stored=True, commas=True, scorable=True)
+                    schema_fields[field_class.index_fieldname] = KEYWORD(stored=True, commas=True, scorable=True, field_boost=field_class.boost)
             elif field_class.field_type in ['date', 'datetime']:
                 schema_fields[field_class.index_fieldname] = DATETIME(stored=field_class.stored)
             elif field_class.field_type == 'integer':
-                schema_fields[field_class.index_fieldname] = NUMERIC(stored=field_class.stored, type=int)
+                schema_fields[field_class.index_fieldname] = NUMERIC(stored=field_class.stored, type=int, field_boost=field_class.boost)
             elif field_class.field_type == 'float':
-                schema_fields[field_class.index_fieldname] = NUMERIC(stored=field_class.stored, type=float)
+                schema_fields[field_class.index_fieldname] = NUMERIC(stored=field_class.stored, type=float, field_boost=field_class.boost)
             elif field_class.field_type == 'boolean':
+                # Field boost isn't supported on BOOLEAN as of 1.8.2.
                 schema_fields[field_class.index_fieldname] = BOOLEAN(stored=field_class.stored)
+            elif field_class.field_type == 'ngram':
+                schema_fields[field_class.index_fieldname] = NGRAM(minsize=3, maxsize=15, stored=field_class.stored, field_boost=field_class.boost)
+            elif field_class.field_type == 'edge_ngram':
+                schema_fields[field_class.index_fieldname] = NGRAMWORDS(minsize=2, maxsize=15, stored=field_class.stored, field_boost=field_class.boost)
             else:
-                schema_fields[field_class.index_fieldname] = TEXT(stored=True, analyzer=StemmingAnalyzer())
+                schema_fields[field_class.index_fieldname] = TEXT(stored=True, analyzer=StemmingAnalyzer(), field_boost=field_class.boost)
             
             if field_class.document is True:
                 content_field_name = field_class.index_fieldname
@@ -171,7 +176,13 @@ class SearchBackend(BaseSearchBackend):
             for key in doc:
                 doc[key] = self._from_python(doc[key])
             
-            writer.update_document(**doc)
+            try:
+                writer.update_document(**doc)
+            except Exception, e:
+                if not self.silently_fail:
+                    raise
+                
+                self.log.error("Failed to add documents to Whoosh: %s", e)
         
         if len(iterable) > 0:
             # For now, commit no matter what, as we run into locking issues otherwise.
@@ -188,7 +199,14 @@ class SearchBackend(BaseSearchBackend):
         
         self.index = self.index.refresh()
         whoosh_id = get_identifier(obj_or_string)
-        self.index.delete_by_query(q=self.parser.parse(u'%s:"%s"' % (ID, whoosh_id)))
+        
+        try:
+            self.index.delete_by_query(q=self.parser.parse(u'%s:"%s"' % (ID, whoosh_id)))
+        except Exception, e:
+            if not self.silently_fail:
+                raise
+            
+            self.log.error("Failed to remove document '%s' from Whoosh: %s", whoosh_id, e)
     
     def clear(self, models=[], commit=True):
         if not self.setup_complete:
@@ -196,15 +214,21 @@ class SearchBackend(BaseSearchBackend):
         
         self.index = self.index.refresh()
         
-        if not models:
-            self.delete_index()
-        else:
-            models_to_delete = []
+        try:
+            if not models:
+                self.delete_index()
+            else:
+                models_to_delete = []
+                
+                for model in models:
+                    models_to_delete.append(u"%s:%s.%s" % (DJANGO_CT, model._meta.app_label, model._meta.module_name))
+                
+                self.index.delete_by_query(q=self.parser.parse(u" OR ".join(models_to_delete)))
+        except Exception, e:
+            if not self.silently_fail:
+                raise
             
-            for model in models:
-                models_to_delete.append(u"%s:%s.%s" % (DJANGO_CT, model._meta.app_label, model._meta.module_name))
-            
-            self.index.delete_by_query(q=self.parser.parse(u" OR ".join(models_to_delete)))
+            self.log.error("Failed to remove document '%s' from Whoosh: %s", whoosh_id, e)
     
     def delete_index(self):
         # Per the Whoosh mailing list, if wiping out everything from the index,
@@ -228,7 +252,7 @@ class SearchBackend(BaseSearchBackend):
     def search(self, query_string, sort_by=None, start_offset=0, end_offset=None,
                fields='', highlight=False, facets=None, date_facets=None, query_facets=None,
                narrow_queries=None, spelling_query=None,
-               limit_to_registered_models=None, **kwargs):
+               limit_to_registered_models=None, result_class=None, **kwargs):
         if not self.setup_complete:
             self.setup()
         
@@ -303,7 +327,7 @@ class SearchBackend(BaseSearchBackend):
             registered_models = self.build_registered_models_list()
             
             if len(registered_models) > 0:
-                narrow_queries.add('%s:(%s)' % (DJANGO_CT, ' OR '.join(registered_models)))
+                narrow_queries.add(' OR '.join(['%s:%s' % (DJANGO_CT, rm) for rm in registered_models]))
         
         narrow_searcher = None
         
@@ -363,13 +387,16 @@ class SearchBackend(BaseSearchBackend):
             try:
                 raw_page = ResultsPage(raw_results, page_num, page_length)
             except ValueError:
+                if not self.silently_fail:
+                    raise
+                
                 return {
                     'results': [],
                     'hits': 0,
                     'spelling_suggestion': None,
                 }
             
-            results = self._process_results(raw_page, highlight=highlight, query_string=query_string, spelling_query=spelling_query)
+            results = self._process_results(raw_page, highlight=highlight, query_string=query_string, spelling_query=spelling_query, result_class=result_class)
             searcher.close()
             
             if hasattr(narrow_searcher, 'close'):
@@ -393,20 +420,125 @@ class SearchBackend(BaseSearchBackend):
     
     def more_like_this(self, model_instance, additional_query_string=None,
                        start_offset=0, end_offset=None,
-                       limit_to_registered_models=None, **kwargs):
-        warnings.warn("Whoosh does not handle More Like This.", Warning, stacklevel=2)
-        return {
-            'results': [],
-            'hits': 0,
-        }
+                       limit_to_registered_models=None, result_class=None, **kwargs):
+        if not self.setup_complete:
+            self.setup()
+        
+        # Handle deferred models.
+        if get_proxied_model and hasattr(model_instance, '_deferred') and model_instance._deferred:
+            model_klass = get_proxied_model(model_instance._meta)
+        else:
+            model_klass = type(model_instance)
+        
+        index = self.site.get_index(model_klass)
+        field_name = index.get_content_field()
+        narrow_queries = set()
+        narrowed_results = None
+        self.index = self.index.refresh()
+        
+        if limit_to_registered_models is None:
+            limit_to_registered_models = getattr(settings, 'HAYSTACK_LIMIT_TO_REGISTERED_MODELS', True)
+        
+        if limit_to_registered_models:
+            # Using narrow queries, limit the results to only models registered
+            # with the current site.
+            if narrow_queries is None:
+                narrow_queries = set()
+            
+            registered_models = self.build_registered_models_list()
+            
+            if len(registered_models) > 0:
+                narrow_queries.add('%s:(%s)' % (DJANGO_CT, ' OR '.join(registered_models)))
+        
+        if additional_query_string:
+            narrow_queries.add(additional_query_string)
+        
+        narrow_searcher = None
+        
+        if narrow_queries is not None:
+            # Potentially expensive? I don't see another way to do it in Whoosh...
+            narrow_searcher = self.index.searcher()
+            
+            for nq in narrow_queries:
+                recent_narrowed_results = narrow_searcher.search(self.parser.parse(force_unicode(nq)))
+                
+                if narrowed_results:
+                    narrowed_results.filter(recent_narrowed_results)
+                else:
+                   narrowed_results = recent_narrowed_results
+        
+        # Prevent against Whoosh throwing an error. Requires an end_offset
+        # greater than 0.
+        if not end_offset is None and end_offset <= 0:
+            end_offset = 1
+        
+        # Determine the page.
+        page_num = 0
+        
+        if end_offset is None:
+            end_offset = 1000000
+        
+        if start_offset is None:
+            start_offset = 0
+        
+        page_length = end_offset - start_offset
+        
+        if page_length and page_length > 0:
+            page_num = start_offset / page_length
+        
+        # Increment because Whoosh uses 1-based page numbers.
+        page_num += 1
+        
+        self.index = self.index.refresh()
+        raw_results = EmptyResults()
+        
+        if self.index.doc_count():
+            query = "%s:%s" % (ID, get_identifier(model_instance))
+            searcher = self.index.searcher()
+            parsed_query = self.parser.parse(query)
+            results = searcher.search(parsed_query)
+            
+            if len(results):
+                raw_results = results[0].more_like_this(field_name, top=end_offset)
+            
+            # Handle the case where the results have been narrowed.
+            if narrowed_results and hasattr(raw_results, 'filter'):
+                raw_results.filter(narrowed_results)
+        
+        try:
+            raw_page = ResultsPage(raw_results, page_num, page_length)
+        except ValueError:
+            if not self.silently_fail:
+                raise
+            
+            return {
+                'results': [],
+                'hits': 0,
+                'spelling_suggestion': None,
+            }
+        
+        results = self._process_results(raw_page, result_class=result_class)
+        searcher.close()
+        
+        if hasattr(narrow_searcher, 'close'):
+            narrow_searcher.close()
+        
+        return results
     
-    def _process_results(self, raw_page, highlight=False, query_string='', spelling_query=None):
-        from haystack import site
+    def _process_results(self, raw_page, highlight=False, query_string='', spelling_query=None, result_class=None):
+        if not self.site:
+            from haystack import site
+        else:
+            site = self.site
+        
         results = []
         
         # It's important to grab the hits first before slicing. Otherwise, this
         # can cause pagination failures.
         hits = len(raw_page)
+        
+        if result_class is None:
+            result_class = SearchResult
         
         facets = {}
         spelling_suggestion = None
@@ -425,7 +557,7 @@ class SearchBackend(BaseSearchBackend):
                     
                     if string_key in index.fields and hasattr(index.fields[string_key], 'convert'):
                         # Special-cased due to the nature of KEYWORD fields.
-                        if isinstance(index.fields[string_key], MultiValueField):
+                        if index.fields[string_key].is_multivalued:
                             if value is None or len(value) is 0:
                                 additional_fields[string_key] = []
                             else:
@@ -448,7 +580,7 @@ class SearchBackend(BaseSearchBackend):
                         self.content_field_name: [highlight(additional_fields.get(self.content_field_name), terms, sa, ContextFragmenter(terms), UppercaseFormatter())],
                     }
                 
-                result = SearchResult(app_label, model_name, raw_result[DJANGO_ID], score, **additional_fields)
+                result = result_class(app_label, model_name, raw_result[DJANGO_ID], score, searchsite=self.site, **additional_fields)
                 results.append(result)
             else:
                 hits -= 1
@@ -505,9 +637,9 @@ class SearchBackend(BaseSearchBackend):
                 value = datetime(value.year, value.month, value.day, 0, 0, 0)
         elif isinstance(value, bool):
             if value:
-                value = True
+                value = 'true'
             else:
-                value = False
+                value = 'false'
         elif isinstance(value, (list, tuple)):
             value = u','.join([force_unicode(v) for v in value])
         elif isinstance(value, (int, long, float)):
@@ -556,7 +688,7 @@ class SearchBackend(BaseSearchBackend):
 
 class SearchQuery(BaseSearchQuery):
     def __init__(self, site=None, backend=None):
-        super(SearchQuery, self).__init__(backend=backend)
+        super(SearchQuery, self).__init__(site, backend)
         
         if backend is not None:
             self.backend = backend
@@ -565,9 +697,9 @@ class SearchQuery(BaseSearchQuery):
     
     def _convert_datetime(self, date):
         if hasattr(date, 'hour'):
-            return force_unicode(date.strftime('%Y%m%dT%H%M%S'))
+            return force_unicode(date.strftime('%Y%m%d%H%M%S'))
         else:
-            return force_unicode(date.strftime('%Y%m%dT000000'))
+            return force_unicode(date.strftime('%Y%m%d000000'))
     
     def clean(self, query_fragment):
         """
@@ -598,6 +730,10 @@ class SearchQuery(BaseSearchQuery):
         result = ''
         is_datetime = False
         
+        # Handle when we've got a ``ValuesListQuerySet``...
+        if hasattr(value, 'values_list'):
+            value = list(value)
+        
         if hasattr(value, 'strftime'):
             is_datetime = True
         
@@ -620,10 +756,10 @@ class SearchQuery(BaseSearchQuery):
         else:
             filter_types = {
                 'exact': "%s:%s",
-                'gt': "%s:{%s TO}",
-                'gte': "%s:[%s TO]",
-                'lt': "%s:{TO %s}",
-                'lte': "%s:[TO %s]",
+                'gt': "%s:{%s to}",
+                'gte': "%s:[%s to]",
+                'lt': "%s:{to %s}",
+                'lte': "%s:[to %s]",
                 'startswith': "%s:%s*",
             }
             
@@ -654,7 +790,7 @@ class SearchQuery(BaseSearchQuery):
                 if hasattr(value[1], 'strftime'):
                     end = self._convert_datetime(end)
                 
-                return "%s:[%s TO %s]" % (index_fieldname, start, end)
+                return "%s:[%s to %s]" % (index_fieldname, start, end)
             else:
                 if is_datetime is True:
                     value = self._convert_datetime(value)

@@ -37,7 +37,7 @@ class MockSearchBackend(BaseSearchBackend):
     def search(self, query_string, sort_by=None, start_offset=0, end_offset=None,
                fields='', highlight=False, facets=None, date_facets=None, query_facets=None,
                narrow_queries=None, spelling_query=None,
-               limit_to_registered_models=None, **kwargs):
+               limit_to_registered_models=None, result_class=None, **kwargs):
         from haystack import site
         results = []
         hits = len(self.mock_search_results)
@@ -61,7 +61,7 @@ class MockSearchBackend(BaseSearchBackend):
             'hits': hits,
         }
     
-    def more_like_this(self, model_instance, additional_query_string=None):
+    def more_like_this(self, model_instance, additional_query_string=None, result_class=None):
         return {
             'results': self.mock_search_results,
             'hits': len(self.mock_search_results),
@@ -72,6 +72,11 @@ class CharPKMockSearchBackend(MockSearchBackend):
     model_name = 'charpkmockmodel'
     mock_search_results = [MockSearchResult('core', 'CharPKMockModel', 'sometext', 0.5),
                            MockSearchResult('core', 'CharPKMockModel', '1234', 0.3)]
+
+class ReadQuerySetMockSearchBackend(MockSearchBackend):
+    model_name = 'afifthmockmodel'
+    mock_search_results = [MockSearchResult('core', 'afifthmockmodel', 1, 2),
+                           MockSearchResult('core', 'afifthmockmodel', 2, 2)]
 
 class MixedMockSearchBackend(MockSearchBackend):
     @log_query
