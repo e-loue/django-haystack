@@ -351,7 +351,10 @@ class SearchBackend(BaseSearchBackend):
             elif field_class.field_type == 'integer':
                 field_data['type'] = 'slong'
             elif field_class.field_type == 'float':
-                field_data['type'] = 'sfloat'
+                if field_name in ['lat', 'lng']:
+                    field_data['type'] = 'tdouble'
+                else:
+                    field_data['type'] = 'sfloat'
             elif field_class.field_type == 'boolean':
                 field_data['type'] = 'boolean'
             elif field_class.field_type == 'ngram':
@@ -487,6 +490,10 @@ class SearchQuery(BaseSearchQuery):
         
         if spelling_query:
             search_kwargs['spelling_query'] = spelling_query
+        
+        if self.spatial_query:
+            spatial = ' '.join([ '%s=%s' % (k,v) for k,v in self.spatial_query.items()])
+            final_query = '{!spatial %s}%s' % (spatial, final_query)
         
         search_kwargs.update(kwargs)
         
