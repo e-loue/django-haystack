@@ -1,4 +1,8 @@
-from django.conf.urls.defaults import *
+# Django 1.6 fix
+try:
+    from django.conf.urls import *
+except ImportError:
+    from django.conf.urls.defaults import *
 from haystack.backends.dummy_backend import SearchBackend, SearchQuery
 from haystack.forms import FacetedSearchForm
 from haystack.query import SearchQuerySet
